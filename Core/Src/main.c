@@ -22,16 +22,25 @@
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
-
+#include <stdarg.h>
+#include "visi_genie.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
 /* USER CODE BEGIN PTD */
-
+typedef enum {
+	RX_REINITIALIZE,
+	RX_READY
+} RxStatus;
 /* USER CODE END PTD */
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
+#define RX_BUF_SIZE			64
+#define UPDATE_INTERVAL		10
+
+#define CW	0
+#define CCW 1
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -44,7 +53,14 @@ UART_HandleTypeDef huart1;
 UART_HandleTypeDef huart2;
 
 /* USER CODE BEGIN PV */
-
+struct RxBuffer {
+    uint8_t data[RX_BUF_SIZE];
+    uint8_t head; // read from head
+    uint8_t tail; // write from tail
+    uint8_t count;
+    uint8_t new;
+    RxStatus status;
+} rx_buffer;
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -58,7 +74,184 @@ static void MX_USART1_UART_Init(void);
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
+// Uart Functions
 
+char buffer[100];
+void myprintf(const char *fmt, ...) {
+  va_list args;
+  va_start(args, fmt);
+  vsnprintf(buffer, sizeof(buffer), fmt, args);
+  va_end(args);
+
+  int len = strlen(buffer);
+  HAL_UART_Transmit(&huart2, (uint8_t*)buffer, len, 1000);
+
+}
+
+RxStatus ReInitializeRX() {
+	HAL_StatusTypeDef res = HAL_UART_Receive_IT(&huart1, &rx_buffer.new, 1);
+	if (res != HAL_OK) {
+		//myprintf("Failed to Initialize RX Interrupt\r\n");
+		return RX_REINITIALIZE;
+	}
+	return RX_READY;
+}
+
+RxStatus InitializeRX() {
+	rx_buffer.count = 0;
+	rx_buffer.head = 0;
+	rx_buffer.tail = 0;
+	rx_buffer.new = 0;
+	memset(rx_buffer.data, 0, RX_BUF_SIZE);
+
+	HAL_StatusTypeDef res = HAL_UART_Receive_IT(&huart1, &rx_buffer.new, 1);
+	if (res != HAL_OK) {
+		return RX_REINITIALIZE;
+	}
+	return RX_READY;
+}
+
+
+void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart) {
+	HAL_UART_Receive_IT(&huart1, &rx_buffer.new, 1);
+
+	rx_buffer.data[rx_buffer.tail++] = rx_buffer.new;
+	if (rx_buffer.tail == RX_BUF_SIZE) rx_buffer.tail = 0;
+
+	rx_buffer.count++;
+
+	rx_buffer.status = ReInitializeRX();
+}
+
+void ResetDisplay() {
+	//HAL_GPIO_WritePin(DISP_RST_GPIO_Port, DISP_RST_Pin, GPIO_PIN_RESET);
+	HAL_Delay(500);
+	//HAL_GPIO_WritePin(DISP_RST_GPIO_Port, DISP_RST_Pin, GPIO_PIN_SET);
+	HAL_Delay(3000);
+}
+
+// Externs
+
+void showError(uint16_t interval) {
+    while (1) {
+	//	HAL_GPIO_WritePin(LED_GPIO_Port, LED_Pin, GPIO_PIN_SET); // here we toggle the led on and off after every successful ping interval.
+		HAL_Delay(interval);
+	//	HAL_GPIO_WritePin(LED_GPIO_Port, LED_Pin, GPIO_PIN_RESET);
+		HAL_Delay(interval);
+	}
+}
+
+unsigned long millis(void) {
+	return HAL_GetTick();
+}
+
+uint16_t genieGetByteCount() {
+	//myprintf("Genie Bytes Available : %i\r\n",rx_buffer.count);
+	return rx_buffer.count;
+}
+
+
+void geniePutByte(uint8_t c) {
+	HAL_UART_Transmit(&huart1, &c, 1, 10000);
+	if (rx_buffer.status == RX_REINITIALIZE) {
+		rx_buffer.status = ReInitializeRX();
+	}
+}
+
+uint8_t genieGetByte() {
+	if (rx_buffer.count == 0) return -1;
+	uint8_t val = rx_buffer.data[rx_buffer.head++];
+	if (rx_buffer.head == RX_BUF_SIZE) rx_buffer.head = 0;
+	rx_buffer.count--;
+	return val;
+}
+
+uint8_t geniePeekByte() {
+	return rx_buffer.data[rx_buffer.head];
+}
+
+// Handlers
+void myDebugHandler(char *str){
+	myprintf("%s\r\n", str);
+}
+
+
+
+void myGenieEventHandler(void) {
+	genieFrame Event;
+	genieDequeueEvent(&Event);
+
+	//If the cmd received is from a Reported Event (Events triggered from the Events tab of Workshop4 objects)
+	static int slider_val = 0;
+
+	/* If the commamd received is from a Reported Event, it will be processed here. */
+	if (Event.reportObject.cmd == GENIE_REPORT_EVENT) {
+	    if (Event.reportObject.object == GENIE_OBJ_SLIDER) { // If the Reported Message was from a Slider
+	        if (Event.reportObject.index == 0) { // If Slider0 (Index = 0)
+	            slider_val = genieGetEventData( & Event); // Receive the event data from the Slider0
+	            genieWriteObject(GENIE_OBJ_LED_DIGITS, 0, slider_val); // Write Slider0 value to to LED Digits 0
+	        }
+	    }
+	}
+
+	/* If the commamd received is from a Reported Object, which occurs if a Read Object (genie.ReadOject) is requested in the main code, reply processed here. */
+	else if (Event.reportObject.cmd == GENIE_REPORT_OBJ) {
+	    if (Event.reportObject.object == GENIE_OBJ_USER_LED) { // If the Reported Message was from a User LED
+	        if (Event.reportObject.index == 0) { // If UserLed0 (Index = 0)
+	            bool UserLed0_val = genieGetEventData( & Event); // Receive the event data from the UserLed0
+	            UserLed0_val = !UserLed0_val; // Toggle the state of the User LED Variable
+	            genieWriteObject(GENIE_OBJ_USER_LED, 0, UserLed0_val); // Write UserLed0_val value back to to UserLed0
+	        }
+	    }
+	}
+
+	/********** This can be expanded as more objects are added that need to be captured *************
+	*************************************************************************************************
+	Event.reportObject.cmd is used to determine the command of that event, such as an reported event
+	Event.reportObject.object is used to determine the object type, such as a Slider
+	Event.reportObject.index is used to determine the index of the object, such as Slider0
+	genieGetEventData(&Event) us used to save the data from the Event, into a variable.
+	*************************************************************************************************/
+	else if (Event.reportObject.cmd == GENIE_PING) {
+	    if (Event.reportObject.object == GENIE_DISCONNECTED) {
+	        /* This function runs once, when the LCD is disconnected, because it was turned off or out of sync.
+	        You may use this to process necessary code. */
+	    	//HAL_GPIO_WritePin(LED_GPIO_Port, LED_Pin, GPIO_PIN_SET);
+
+//			uint16_t reason = genieGetEventData(&Event); // Receive the reason
+//			if (reason == 1) {
+//				HAL_GPIO_WritePin(LED_GPIO_Port, LED_Pin, GPIO_PIN_SET);
+//				while (1);
+//			} else {
+//				while (1) {
+//					HAL_GPIO_WritePin(LED_GPIO_Port, LED_Pin, GPIO_PIN_SET); // here we toggle the led on and off after every successful ping interval.
+//					HAL_Delay(500);
+//					HAL_GPIO_WritePin(LED_GPIO_Port, LED_Pin, GPIO_PIN_RESET);
+//					HAL_Delay(500);
+//				}
+//			}
+
+
+	    } else if (Event.reportObject.object == GENIE_READY) {
+	        /* This function runs once, when the LCD is connected and synchronized.
+	        You may use this to restore screen widgets, or process other code. */
+	    	genieWriteObject(GENIE_OBJ_LED_DIGITS, 0, slider_val); // Restore Leddigits0
+	        genieWriteObject(GENIE_OBJ_SLIDER, 0, slider_val); // Restore Slider0
+	        static int recover_times = -1; // how many times did the display recover?
+	        recover_times++;
+//	        genieWriteStr(0, (String) GENIE_VERSION + "\n\n\tRecovered " + recover_times + " Time(s)!"); // Restore text in Strings0
+	    } else if (Event.reportObject.object == GENIE_ACK) {
+	        /* If a user issues a genie.Ping(interval) request and it passes,
+	        this function will happen every 'interval' times chosen by the user. */
+//	         HAL_GPIO_WritePin(LED_GPIO_Port, LED_Pin, GPIO_PIN_SET); // here we toggle the led on and off after every successful ping interval.
+//	         HAL_Delay(20);
+//	         HAL_GPIO_WritePin(LED_GPIO_Port, LED_Pin, GPIO_PIN_RESET);
+	    } else if (Event.reportObject.object == GENIE_NAK) {
+	        /* If a user issues a genie.Ping(interval) request and it fails,
+	        this function will happen every 'interval' times chosen by the user. */
+	    }
+	}
+}
 /* USER CODE END 0 */
 
 /**
@@ -93,12 +286,68 @@ int main(void)
   MX_USART1_UART_Init();
   /* USER CODE BEGIN 2 */
 
+  ResetDisplay();
+  InitializeRX();
+  genieBegin();
+  genieAttachEventHandler(myGenieEventHandler);
+  genieAttachDebugger(myprintf);
+  unsigned long lastUpdate = 0;
+
+  int coolgaugeVal;
+  bool gaugeRotation = CW;
+
+  if (genieOnline()) {
+      /* Set the brightness/Contrast of the Display - (Not needed but illustrates how)
+      Most Displays, 1 = Display ON, 0 = Display OFF. See below for exceptions and for DIABLO16 displays.
+      For uLCD-43, uLCD-220RD, uLCD-70DT, and uLCD-35DT, use 0-15 for Brightness Control, where 0 = Display OFF, though to 15 = Max Brightness ON. */
+      genieWriteContrast(15);
+  } else
+
+  /* returns the current form the lcd is on */
+  if (genieCurrentForm() == 0) {
+      // if lcd is on form 0, do something.
+  }
+
+  genieWriteStr(0, GENIE_VERSION);
+  lastUpdate = millis() - UPDATE_INTERVAL;
+
+  uint8_t state;
   /* USER CODE END 2 */
 
   /* Infinite loop */
   /* USER CODE BEGIN WHILE */
   while (1)
   {
+
+	  genieDoEvents();
+	  if (millis() - lastUpdate >= UPDATE_INTERVAL) {
+		  lastUpdate = millis();
+		  state = !(state);
+
+		  if (state) genieWriteStr(0, "Programa DEMO");
+		  else genieWriteStr(0, GENIE_VERSION);
+
+		 // HAL_GPIO_WritePin(LED_GPIO_Port, LED_Pin, state);
+		  if (genieOnline()) { // check if the display is online (connected) and if on Form0
+		      if (gaugeRotation == CW) {
+		          coolgaugeVal++;
+		          if (coolgaugeVal > 100) {
+		              coolgaugeVal = 100;
+		              gaugeRotation = CCW;
+		          }
+		      } else if (gaugeRotation == CCW) {
+		          coolgaugeVal--;
+		          if (coolgaugeVal < 0) {
+		              coolgaugeVal = 0;
+		              gaugeRotation = CW;
+		          }
+		      }
+			genieWriteObject(GENIE_OBJ_COOL_GAUGE, 0, coolgaugeVal);
+
+			// The results of this call will be available to myGenieEventHandler() after the display has responded
+			genieReadObject(GENIE_OBJ_USER_LED, 0); // Do a manual read from the UserLEd0 object
+		}
+	  }
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
